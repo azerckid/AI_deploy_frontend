@@ -1,4 +1,4 @@
-# Nomad Agents Frontend
+# AI Agents Frontend
 
 React Router Framework Mode + Shadcn UI 기반 멀티 에이전트 대시보드입니다. 좌측에는 대화 목록, 우측에는 채팅 패널/입력창으로 구성되어 있으며, 현재는 OpenAI 백엔드 연동 전 UI 목업 상태입니다.
 

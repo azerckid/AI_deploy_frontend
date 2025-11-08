@@ -7,7 +7,7 @@ export function Toaster() {
       richColors
       closeButton
       theme="system"
-      duration={4000}
+      duration={5000}
     />
   );
 }

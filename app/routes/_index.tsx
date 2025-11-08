@@ -1,8 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { createCookie, data } from "react-router";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
 import { Plus, SendHorizonal, Sparkles } from "lucide-react";
 import { toast } from "sonner";
 
+import { createConversation, createMessage } from "../lib/api.server";
+import { streamMessage } from "../lib/api.client";
 import { Button } from "../components/ui/button";
 import { Card, CardContent } from "../components/ui/card";
 import { ScrollArea } from "../components/ui/scroll-area";
@@ -12,6 +15,13 @@ import { cn } from "../lib/utils";
 import type { Route } from "./+types/_index";
 
 const PAGE_TITLE = "Nomad Agents";
+
+const conversationCookie = createCookie("agent_conversation", {
+  path: "/",
+  httpOnly: true,
+  sameSite: "lax",
+  maxAge: 60 * 60 * 24 * 7,
+});
 
 type Author = "user" | "assistant";
 
@@ -104,38 +114,99 @@ export function meta({}: Route.MetaArgs) {
   ];
 }
 
-export function loader({}: Route.LoaderArgs): LoaderData {
-  return {
-    conversations: [
-      {
-        id: "c1",
-        title: "팀 온보딩 체크리스트",
-        lead: "핵심 문서와 일정 정리를 도와드릴게요.",
-        updatedAt: "2025-11-08T06:45:00Z",
-      },
-      {
-        id: "c2",
-        title: "프로덕트 전략 브리핑",
-        lead: "최근 사용자 피드백을 요약하고 전략을 제안했습니다.",
-        updatedAt: "2025-11-07T23:30:00Z",
-      },
-      {
-        id: "c3",
-        title: "영업 미팅 준비",
-        lead: "경쟁사 대비 장점과 예상 질문 리스트를 생성했습니다.",
-        updatedAt: "2025-11-06T15:18:00Z",
-      },
-    ],
-    activeConversationId: "c1",
+export async function loader({ request }: Route.LoaderArgs): Promise<Response | LoaderData> {
+  return handleLoader(request);
+}
+
+async function handleLoader(request: Request): Promise<Response | LoaderData> {
+  const cookieHeader = request.headers.get("Cookie");
+  const storedConversationId = await conversationCookie.parse(cookieHeader);
+
+  let activeConversationId = typeof storedConversationId === "string" ? storedConversationId : null;
+  const headers = new Headers();
+
+  if (!activeConversationId) {
+    try {
+      const created = await createConversation();
+      activeConversationId = created.conversation_id;
+      headers.append("Set-Cookie", await conversationCookie.serialize(activeConversationId));
+    } catch (error) {
+      console.error("Failed to create backend conversation", error);
+    }
+  }
+
+  const conversations: ConversationSummary[] = [
+    {
+      id: activeConversationId ?? "c1",
+      title: "팀 온보딩 체크리스트",
+      lead: "핵심 문서와 일정 정리를 도와드릴게요.",
+      updatedAt: new Date().toISOString(),
+    },
+    {
+      id: "c2",
+      title: "프로덕트 전략 브리핑",
+      lead: "최근 사용자 피드백을 요약하고 전략을 제안했습니다.",
+      updatedAt: "2025-11-07T23:30:00Z",
+    },
+    {
+      id: "c3",
+      title: "영업 미팅 준비",
+      lead: "경쟁사 대비 장점과 예상 질문 리스트를 생성했습니다.",
+      updatedAt: "2025-11-06T15:18:00Z",
+    },
+  ];
+
+  const payload: LoaderData = {
+    conversations,
+    activeConversationId: activeConversationId ?? conversations[0]?.id ?? null,
   } satisfies LoaderData;
+
+  if (headers.has("Set-Cookie")) {
+    return data(payload, { headers });
+  }
+
+  return payload;
 }
 
 export async function action({ request }: Route.ActionArgs): Promise<ActionData> {
-  return {
-    ok: false,
-    message: "Not implemented",
-    method: request.method,
-  } satisfies ActionData;
+  const formData = await request.formData();
+  const conversationId = formData.get("conversationId");
+  const question = formData.get("question");
+
+  if (typeof conversationId !== "string" || !conversationId) {
+    return {
+      ok: false,
+      message: "conversationId is required",
+      method: request.method,
+    } satisfies ActionData;
+  }
+
+  if (typeof question !== "string" || !question.trim()) {
+    return {
+      ok: false,
+      message: "question is required",
+      method: request.method,
+    } satisfies ActionData;
+  }
+
+  try {
+    await createMessage(conversationId, { question });
+    return {
+      ok: true,
+      message: "queued",
+      method: request.method,
+    } satisfies ActionData;
+  } catch (error) {
+    const err = error instanceof Error ? error : new Error("unknown error");
+    return data(
+      {
+        ok: false,
+        message: err.message,
+        method: request.method,
+      } satisfies ActionData,
+      { status: 500 }
+    );
+  }
 }
 
 export default function IndexRoute({ loaderData }: Route.ComponentProps) {
@@ -150,12 +221,19 @@ export default function IndexRoute({ loaderData }: Route.ComponentProps) {
   const [messages, setMessages] = useState<Message[]>(() => seedThread(data.activeConversationId));
   const [draft, setDraft] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
+  const streamControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     setMessages(seedThread(activeConversationId));
     setIsStreaming(false);
     setDraft("");
   }, [activeConversationId]);
+
+  useEffect(() => {
+    return () => {
+      streamControllerRef.current?.abort();
+    };
+  }, []);
 
   const handleSelectConversation = useCallback((conversationId: string) => {
     setActiveConversationId(conversationId);
@@ -171,6 +249,8 @@ export default function IndexRoute({ loaderData }: Route.ComponentProps) {
       toast.warning("메시지를 입력해 주세요.");
       return;
     }
+
+    streamControllerRef.current?.abort();
 
     const nowIso = new Date().toISOString();
     const userMessage: Message = {
@@ -192,24 +272,51 @@ export default function IndexRoute({ loaderData }: Route.ComponentProps) {
     setDraft("");
     setIsStreaming(true);
 
-    const canned = DEMO_RESPONSES[activeConversationId] ?? "현재는 데모 응답입니다.";
-    // TODO: Replace canned response with streaming call to the backend agent API.
-    setTimeout(() => {
-      setMessages((prev) =>
-        prev.map((message) =>
-          message.id === placeholderId
-            ? {
-                ...message,
-                content: canned,
-                createdAt: new Date().toISOString(),
-                isDraft: false,
-              }
-            : message
-        )
-      );
-      setIsStreaming(false);
-      toast.success("데모 응답이 도착했습니다.");
-    }, 1000);
+    const controller = new AbortController();
+    streamControllerRef.current = controller;
+
+    let buffer = "";
+
+    void streamMessage({
+      conversationId: activeConversationId,
+      question: trimmed,
+      signal: controller.signal,
+      onChunk: (delta) => {
+        buffer += delta;
+        setMessages((prev) =>
+          prev.map((message) =>
+            message.id === placeholderId
+              ? {
+                  ...message,
+                  content: buffer,
+                }
+              : message
+          )
+        );
+      },
+      onComplete: () => {
+        setIsStreaming(false);
+        setMessages((prev) =>
+          prev.map((message) =>
+            message.id === placeholderId
+              ? {
+                  ...message,
+                  createdAt: new Date().toISOString(),
+                  isDraft: false,
+                  content: buffer || message.content,
+                }
+              : message
+          )
+        );
+        toast.success("응답이 도착했습니다.");
+      },
+      onError: (error) => {
+        console.error("stream error", error);
+        setIsStreaming(false);
+        setMessages((prev) => prev.filter((message) => message.id !== placeholderId));
+        toast.error("응답을 가져오지 못했습니다. 다시 시도해 주세요.");
+      },
+    });
   }, [activeConversationId, draft]);
 
   const handleDraftKeyDown = useCallback(
@@ -433,7 +540,10 @@ function seedThread(conversationId: string | null): Message[] {
   if (!conversationId) {
     return [];
   }
-  return [...(SAMPLE_THREADS[conversationId] ?? [])];
+  if (conversationId in SAMPLE_THREADS) {
+    return [...(SAMPLE_THREADS[conversationId] ?? [])];
+  }
+  return [];
 }
 
 function getActiveTitle(conversations: ConversationSummary[], id: string | null) {
